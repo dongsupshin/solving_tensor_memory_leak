@@ -1,0 +1,5 @@
+# Same web stack + RSS loop without TensorFlow (CPUs / VMs without AVX, e.g. VirtualBox).
+numpy>=1.22,<2
+psutil>=5.9.0
+fastapi>=0.109,<1
+uvicorn[standard]>=0.27,<1

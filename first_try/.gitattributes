@@ -1,0 +1,2 @@
+# Avoid CRLF shebang on Linux (bash\r: No such file or directory)
+run.sh text eol=lf
