@@ -1,0 +1,6 @@
+{"ts_unix": 1777965723.026, "elapsed_s": 0.0, "rss_mb": 308.19, "iter": 0}
+{"ts_unix": 1777965724.035, "elapsed_s": 1.0, "rss_mb": 337.54, "iter": 0}
+{"ts_unix": 1777965725.036, "elapsed_s": 2.0, "rss_mb": 371.81, "iter": 1}
+{"ts_unix": 1777965726.038, "elapsed_s": 3.0, "rss_mb": 387.73, "iter": 3}
+{"ts_unix": 1777965727.041, "elapsed_s": 4.0, "rss_mb": 387.75, "iter": 6}
+{"ts_unix": 1777965728.042, "elapsed_s": 5.0, "rss_mb": 392.66, "iter": 8}
