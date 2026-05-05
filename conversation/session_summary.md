@@ -439,3 +439,71 @@ SEG 재시작 동안 HR/RR 결측 방지:
    - `py_tracemalloc_cur_mb`
    - `native_est_mb`
    를 동시에 저장해 plateau 여부 최종 판정.
+
+---
+
+## 15. 2026-05-05 세션 2 — sixth_try 설계 및 생성
+
+### 15.1 설계 배경 및 방향 전환
+
+fifth_try 결과(`tf_fn` 경로에서 최근 300초 증가율 1.32 MB/h)를 바탕으로, 다음 목표를 설정:
+
+- Fixed Batch Padding **제외** — 가변 batch 크기를 예측할 수 없음 (1명~수만명 모두 가능)
+- `K.clear_session()` **제외** — 15/15회 +267 MB 스파이크 확인, 제거가 최선
+- **근본 목표**: TF C++ allocator가 사용 후 메모리를 실제로 OS에 반환하게 강제
+
+### 15.2 sixth_try 핵심 메커니즘
+
+`C:\Users\dongs\workspace\solving_tensor_memory_leak\sixth_try\`
+
+| 메커니즘 | 설명 | 근거 |
+|---|---|---|
+| `TF_ALLOCATOR_USE_BFC=0` | BFC allocator 비활성화 → system malloc(tcmalloc) 교체. free() 시 OS 반환 | BFC는 설계상 OS 미반환 |
+| `CUDA_VISIBLE_DEVICES=""` + `tf.config.set_visible_devices([], "GPU")` | CPU only 완전 강제 | GPU 미사용 환경 |
+| `@tf.function(input_signature=[None, 768, 1], reduce_retracing=True)` | batch dim=None → 1명~수만명 모두 단일 ConcreteFunction, retrace=0 | fifth_try tf_fn 검증 ✓ |
+| Pre-warm 20회 | 시작 시 dummy 데이터로 20회 추론 → Eigen 스레드풀 + allocator high-water mark 초기 안정화 | Layer 4(Eigen) 처방 |
+| `malloc_trim(0)` 주기 호출 (100 iter마다) | glibc free 힙 페이지 OS 강제 반환 | `libc.so.6` 직접 ctypes 호출 |
+| tcmalloc auto-load + `TCMALLOC_RELEASE_RATE=10` | `libtcmalloc_minimal` 자동 탐지·로드, free 후 초당 OS 반환 | BFC=0 + tcmalloc 조합 |
+| `gc.collect()` 100 iter마다 | Python 레퍼런스 사이클 청소 | Python heap 잔존 누수 방지 |
+
+### 15.3 웹 UI 개선 (eighth_try 대비)
+
+- **3-line 메인 차트**: RSS · Python heap · Native/TF 추정 동시 표시
+- **증가율 차트**: 60초 이동평균 MB/min — plateau 도달 시 0 수렴 확인용
+- **실시간 진단 패널**: RSS, USS, Python heap, Native 추정, GC objects, Iterations
+- **상태 배지**: `ARENA_MAX`, `TF_BFC 비활성화 여부`, `tcmalloc 로드 여부` 한눈에 확인
+- 포트: `http://127.0.0.1:8766/`
+
+### 15.4 실행 방법
+
+```bash
+cd sixth_try
+chmod +x run.sh
+./run.sh
+# 브라우저: http://127.0.0.1:8766/
+```
+
+tcmalloc 활성화 (OS 반환 효과 극대화):
+```bash
+sudo apt install -y google-perftools
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 ./run.sh
+```
+
+### 15.5 기대 결과 매트릭스
+
+| 조건 | 기대 RSS 곡선 | 판정 기준 |
+|---|---|---|
+| `tf_fn` 단독 (fifth_try 수준) | 완만한 우상향, ~1–2 MB/h | 기준선 |
+| `tf_fn` + `BFC=0` + `malloc_trim` | 초기 상승 후 plateau | 증가율 차트 → 0 수렴 |
+| 위 + tcmalloc `LD_PRELOAD` | 더 이른 plateau, 낮은 steady-state | 최우선 목표 ✓ |
+
+plateau 판정: **증가율 차트가 30분 이상 ±0.5 MB/min 이내** 유지 시 운영 적용 승인.
+
+### 15.6 다음 단계
+
+plateau 확인 후 `IPM_SEGMENTATION.py` 적용 순서:
+1. `__init__`에서 `tf.config.set_visible_devices([], "GPU")` 추가
+2. `predict_batch`를 `@tf.function(input_signature=...)` + `model(x, training=False)` 경로로 교체
+3. 생성자에서 `infer_fn` 단 한 번만 정의 (loop 안에서 재정의 금지)
+4. `run.sh` / 서비스 시작 스크립트에 `TF_ALLOCATOR_USE_BFC=0`, `TCMALLOC_RELEASE_RATE=10`, `MALLOC_ARENA_MAX=2` 추가
+5. 24h soak test 후 plateau 최종 확인
