@@ -374,3 +374,68 @@ SEG 재시작 동안 HR/RR 결측 방지:
 7. **TF Serving 검토** — 누수 80-95% 감소 가능하나 over-engineering
 8. **TF 2.8.2 다운그레이드 검토** — 단기 효과 크지만 EOL/SavedModel 호환성 부담
 9. **2026-05-05 (이번 세션)**: third_try ablation 환경 셋업 완료. 모델 재빌드가 결정적 차이일 가능성 발견
+
+---
+
+## 14. 2026-05-05 추가 업데이트 (Cursor 실험 로그 반영)
+
+### 14.1 사용자가 현재 겪는 문제 (명시)
+
+- `third_try`, `fourth_try` 비교 시 그래프가 모두 우상향처럼 보이지만, **실제 원인이 Python heap 누적인지 TF/native(C++) allocator 누적인지 판단이 어려운 상태**.
+- 운영 목표는 동일: **장기 plateau(수 주~수 개월) 달성**.  
+  단순 완화가 아니라, 누수 주체(파이썬 vs 텐서/네이티브)를 분리 진단해 근본 수정 필요.
+
+### 14.2 이번 세션에서 새로 만든 실험 폴더
+
+- `fourth_try/`  
+  - `third_try` 기반.
+  - 차이: `clear_every` 시점에 `K.clear_session()` 후 **모델 재빌드/compile**.
+  - 목적: clear-only(`third_try`)와 clear+rebuild(`fourth_try`) 메모리 추세 비교.
+
+- `fifth_try/`  
+  - `third_try` 기반 진단 하네스.
+  - 핵심: 추론 엔진 2개를 동일 workload에서 교차 비교
+    - `--engine predict`: `model.predict_on_batch` 경로
+    - `--engine tf_fn`: 단일 traced `@tf.function` + `model(x, training=False)` 경로 (기본값)
+  - 메모리 분해 지표 추가:
+    - `rss_mb`, `uss_mb`
+    - `py_tracemalloc_cur_mb`, `py_tracemalloc_peak_mb`
+    - `native_est_mb = rss - py_tracemalloc_current` (근사)
+    - `gc_objects`, `allocated_blocks`
+    - `growth_class` 자동 분류
+  - 목적: **#58676 계열(keras predict 경로) 영향과 Python heap 영향 분리**.
+
+### 14.3 직접 실행 비교 결과 (fifth_try, `--opt3`, `MALLOC_ARENA_MAX=2`)
+
+동일 시간축(약 989초)으로 맞춰 비교:
+
+- `--engine predict`
+  - RSS 증가: **+169.11 MB**
+  - Python(tracemalloc) 증가: **+11.67 MB**
+  - Native 추정 증가: **+157.44 MB**
+  - 최근 300초 증가율: **385.38 MB/h**
+  - 최근 600초 증가율: **226.41 MB/h**
+
+- `--engine tf_fn` (동일 989초 구간 환산)
+  - RSS 증가: **+117.45 MB**
+  - Python(tracemalloc) 증가: **+10.38 MB**
+  - Native 추정 증가: **+107.06 MB**
+  - 최근 300초 증가율: **1.32 MB/h**
+  - 최근 600초 증가율: **1.44 MB/h**
+
+해석:
+
+- 증가분의 대부분은 Python heap보다 **native/TF 쪽**에서 발생.
+- `tf_fn` 경로는 최근 구간 증가율을 크게 낮춤(거의 평탄 수준).
+- 즉, 현재 데이터는 **Python 메모리 누수 단독보다는 TF/Keras predict 경로(#58676 계열) + allocator 동작 영향** 가설을 지지.
+
+### 14.4 현재 권장 운영 방향 (임시)
+
+1. `fifth_try` 기본 엔진을 `tf_fn`으로 유지.
+2. 실제 upstream에도 `predict_on_batch` 중심 경로 대신  
+   `@tf.function(input_signature=...)` + `model(x, training=False)` 경로를 우선 이식 검토.
+3. 장기(>=6h, 가능하면 24h) soak test에서
+   - `rss_mb`
+   - `py_tracemalloc_cur_mb`
+   - `native_est_mb`
+   를 동시에 저장해 plateau 여부 최종 판정.
