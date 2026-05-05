@@ -7,6 +7,8 @@ Mirrors IPM_SEGMENTATION_PROCESS.segment() + IPM_SEGMENTATION.predict_batch():
   - Every CLEAR_EVERY iters: K.clear_session() + gc.collect()
   - **No** model reload after clear_session (same as upstream — optional rebuild removed)
 
+Optional stress (stronger TF / faster RSS growth): ``--opt1`` (wider model), ``--opt2`` / ``--opt3`` (extra ``predict_on_batch`` per segment). Combine as needed.
+
 RSS logged every second to <LOG_PREFIX>.jsonl and .csv.
 
 Live RSS trend: FastAPI + Chart.js on ``THIRD_TRY_WEB_HOST`` / ``THIRD_TRY_WEB_PORT`` (defaults ``0.0.0.0:8765``), same pattern as ``second_try``.
@@ -15,6 +17,7 @@ Live RSS trend: FastAPI + Chart.js on ``THIRD_TRY_WEB_HOST`` / ``THIRD_TRY_WEB_P
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import os
@@ -38,12 +41,15 @@ ECG_BUFFER_LEN = 20_000   # per-patient circular ECG buffer (samples)
 N_PATIENTS = 50
 N_CLASSES = 6
 
-# ── Single run profile (no CLI — edit here if you need to tune) ─────────────
+# ── Default run profile (override with ``--opt1`` / ``--opt2`` / ``--opt3``) ─
 LOG_PREFIX = "rss_log"
 BASE_CH = 32
 POLL_SLEEP = 0.2
 CLEAR_EVERY = 50
 MAX_PATIENTS = N_PATIENTS
+
+# opt1: add this many channels to every Conv1D width step (heavier graph + activations).
+BASE_CH_STRESS = 32
 
 WEB_HOST = os.environ.get("THIRD_TRY_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("THIRD_TRY_WEB_PORT", "8765"))
@@ -56,6 +62,18 @@ class RunConfig:
     poll_sleep: float = POLL_SLEEP
     clear_every: int = CLEAR_EVERY
     max_patients: int = MAX_PATIENTS
+    opt1: bool = False  # wider model (+channels)
+    opt2: bool = False  # +1 extra predict_on_batch per segment
+    opt3: bool = False  # +1 more predict_on_batch per segment
+
+
+def _effective_base_ch(cfg: RunConfig) -> int:
+    return cfg.base_ch + (BASE_CH_STRESS if cfg.opt1 else 0)
+
+
+def _extra_predict_passes(cfg: RunConfig) -> int:
+    """Additional ``predict_on_batch`` calls after the first (opt2 and opt3 each add one)."""
+    return int(cfg.opt2) + int(cfg.opt3)
 
 
 # ── Global state ──────────────────────────────────────────────────────────────
@@ -214,6 +232,7 @@ def _segment(
     container_manager: FakeContainerManager,
     needed_ids: list,
     rng: np.random.Generator,
+    cfg: RunConfig,
 ) -> None:
     import tensorflow as tf
 
@@ -265,6 +284,8 @@ def _segment(
         with tf.device("/CPU:0"):
             tf_arr = tf.convert_to_tensor(signals, dtype=tf.float64)
             _predict = model.predict_on_batch(tf_arr)
+            for _ in range(_extra_predict_passes(cfg)):
+                _predict = model.predict_on_batch(tf_arr)
             del tf_arr
 
         predicted_segments = _predict.copy()
@@ -308,14 +329,20 @@ def _inference_loop(cfg: RunConfig) -> None:
         tf.config.threading.set_intra_op_parallelism_threads(2)
         tf.config.threading.set_inter_op_parallelism_threads(1)
 
-        model = _build_ecg_segmentation_model(ECG_INPUT_NUM, cfg.base_ch)
+        eff_ch = _effective_base_ch(cfg)
+        n_pred = 1 + _extra_predict_passes(cfg)
+        model = _build_ecg_segmentation_model(ECG_INPUT_NUM, eff_ch)
         model.compile(optimizer="adam", loss="mse")
 
         rng = np.random.default_rng(42)
         container_manager = FakeContainerManager(N_PATIENTS, rng)
         proc = psutil.Process(os.getpid())
 
-        print("[third_try] Inference loop (upstream-faithful, no CLI)")
+        print("[third_try] Inference loop (upstream-faithful)")
+        print(
+            f"  stress opts    = opt1={cfg.opt1} opt2={cfg.opt2} opt3={cfg.opt3}  "
+            f"→ base_ch {cfg.base_ch}→{eff_ch}  predict_on_batch×{n_pred}/seg"
+        )
         print(f"  variable_batch = True  max_patients={cfg.max_patients}")
         print(f"  use_roi        = True")
         print(f"  clear_session  = True  clear_every={cfg.clear_every}")
@@ -345,6 +372,7 @@ def _inference_loop(cfg: RunConfig) -> None:
                 container_manager=container_manager,
                 needed_ids=needed_ids,
                 rng=rng,
+                cfg=cfg,
             )
 
             iter_cnt += 1
@@ -502,12 +530,18 @@ def create_app(cfg: RunConfig, tf_version_label: str) -> FastAPI:
         proc = psutil.Process(os.getpid())
         rss = proc.memory_info().rss
         c: RunConfig = app.state.cfg
+        eff = _effective_base_ch(c)
         load = {
             "third_try": True,
+            "opt1": c.opt1,
+            "opt2": c.opt2,
+            "opt3": c.opt3,
+            "base_ch_config": c.base_ch,
+            "base_ch_effective": eff,
+            "predict_on_batch_per_segment": 1 + _extra_predict_passes(c),
             "clear_every": c.clear_every,
             "poll_sleep_sec": c.poll_sleep,
             "max_patients": c.max_patients,
-            "base_ch": c.base_ch,
             "ecg_input_num": ECG_INPUT_NUM,
             "log_prefix": c.log_prefix,
         }
@@ -531,6 +565,27 @@ def create_app(cfg: RunConfig, tf_version_label: str) -> FastAPI:
 def main() -> None:
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
+    p = argparse.ArgumentParser(
+        description="third_try IPM-style leak repro + RSS web chart. "
+        "Each --opt adds TensorFlow work; combine for stronger RSS growth."
+    )
+    p.add_argument(
+        "--opt1",
+        action="store_true",
+        help=f"Stress: wider model (+{BASE_CH_STRESS} to base Conv1D channels).",
+    )
+    p.add_argument(
+        "--opt2",
+        action="store_true",
+        help="Stress: +1 extra predict_on_batch per segment (after the first).",
+    )
+    p.add_argument(
+        "--opt3",
+        action="store_true",
+        help="Stress: +1 more predict_on_batch per segment (cumulative with --opt2).",
+    )
+    args = p.parse_args()
+
     import tensorflow as tf
     import uvicorn
 
@@ -540,6 +595,9 @@ def main() -> None:
         poll_sleep=POLL_SLEEP,
         clear_every=CLEAR_EVERY,
         max_patients=MAX_PATIENTS,
+        opt1=args.opt1,
+        opt2=args.opt2,
+        opt3=args.opt3,
     )
     tf_version_label = f"tensorflow {tf.__version__}"
     app = create_app(cfg, tf_version_label)

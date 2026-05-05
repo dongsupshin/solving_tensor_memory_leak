@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# third_try: upstream-faithful reproduction — single profile, no CLI flags.
+# third_try: upstream-faithful reproduction + optional TensorFlow stress flags.
 # Default: MALLOC_ARENA_MAX=2 (glibc malloc arena cap, same idea as second_try). Override: MALLOC_ARENA_MAX=8 ./run.sh
 #
 #   chmod +x run.sh && ./run.sh
+# Heavier load: ./run.sh -- --opt1
+#   ./run.sh -- --opt1 --opt2 --opt3
 set -euo pipefail
 : "${MALLOC_ARENA_MAX:=2}"
 export MALLOC_ARENA_MAX
@@ -47,4 +49,4 @@ if [ "$tf_ec" != "0" ]; then
   exit 1
 fi
 
-exec python app.py
+exec python app.py "$@"

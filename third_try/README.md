@@ -11,6 +11,14 @@ chmod +x run.sh
 ./run.sh
 ```
 
+TensorFlow 부하를 단계적으로 올리려면(메모리 증가가 더 빨리 보이도록):
+
+- `--opt1` — Conv 채널을 키운 더 큰 모델
+- `--opt2` — 세그먼트당 `predict_on_batch` 1회 추가
+- `--opt3` — `predict_on_batch` 한 번 더 추가 (`--opt2`와 누적, 최대 세그먼트당 3회)
+
+예: `./run.sh -- --opt1` / `./run.sh -- --opt1 --opt2 --opt3`
+
 설정 변경은 `app.py` 상단 상수(`LOG_PREFIX`, `CLEAR_EVERY`, `POLL_SLEEP` 등)를 수정합니다.
 
 `./run.sh`는 기본으로 **`MALLOC_ARENA_MAX=2`** 를 export합니다(glibc malloc arena 상한, `second_try`와 같은 목적). 다른 값을 쓰려면 실행 전에 환경 변수로 덮어쓰면 됩니다.
