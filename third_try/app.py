@@ -8,21 +8,28 @@ Mirrors IPM_SEGMENTATION_PROCESS.segment() + IPM_SEGMENTATION.predict_batch():
   - **No** model reload after clear_session (same as upstream — optional rebuild removed)
 
 RSS logged every second to <LOG_PREFIX>.jsonl and .csv.
+
+Live RSS trend: FastAPI + Chart.js on ``THIRD_TRY_WEB_HOST`` / ``THIRD_TRY_WEB_PORT`` (defaults ``0.0.0.0:8765``), same pattern as ``second_try``.
+
+``run.sh`` sets ``MALLOC_ARENA_MAX=2`` by default; ``main()`` also applies that default if the variable is unset so ``python app.py`` matches.
 """
 from __future__ import annotations
 
 import gc
 import json
 import os
-import signal
 import sys
 import threading
 import time
+from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Deque, Optional
 
 import numpy as np
 import psutil
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # ── Constants matching upstream SEGMENTATION_PARAM ────────────────────────────
 ECG_INPUT_NUM = 768       # SEGMENTATION_PARAM['INPUT_NUM'] = 256 * 3
@@ -38,6 +45,9 @@ POLL_SLEEP = 0.2
 CLEAR_EVERY = 1000
 MAX_PATIENTS = N_PATIENTS
 
+WEB_HOST = os.environ.get("THIRD_TRY_WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.environ.get("THIRD_TRY_WEB_PORT", "8765"))
+
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -52,6 +62,8 @@ class RunConfig:
 _iter_count = 0
 _state_lock = threading.Lock()
 _stop_event = threading.Event()
+_rss_history: Deque[tuple[float, float]] = deque(maxlen=600)  # (unix_ts, rss_bytes)
+_worker_error: str | None = None
 
 
 # ── Synthetic ECG filter (mirrors SEERS_ECG_TOOLS.apply_filters) ─────────────
@@ -279,79 +291,244 @@ def _segment(
     del ids
     del edIdxs
     del FEcgROIs
-    del signals
     del predicted_segments
     del needed_ids
 
 
 # ── Inference loop ────────────────────────────────────────────────────────────
 def _inference_loop(cfg: RunConfig) -> None:
-    global _iter_count
+    global _iter_count, _worker_error
 
     import tensorflow as tf
     from tensorflow.keras import backend as K
 
-    K.clear_session()
-    tf.config.threading.set_intra_op_parallelism_threads(2)
-    tf.config.threading.set_inter_op_parallelism_threads(1)
+    try:
+        K.clear_session()
+        tf.config.threading.set_intra_op_parallelism_threads(2)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
 
-    model = _build_ecg_segmentation_model(ECG_INPUT_NUM, cfg.base_ch)
-    model.compile(optimizer="adam", loss="mse")
+        model = _build_ecg_segmentation_model(ECG_INPUT_NUM, cfg.base_ch)
+        model.compile(optimizer="adam", loss="mse")
 
-    rng = np.random.default_rng(42)
-    container_manager = FakeContainerManager(N_PATIENTS, rng)
-    proc = psutil.Process(os.getpid())
+        rng = np.random.default_rng(42)
+        container_manager = FakeContainerManager(N_PATIENTS, rng)
+        proc = psutil.Process(os.getpid())
 
-    print("[third_try] Inference loop (upstream-faithful, no CLI)")
-    print(f"  variable_batch = True  max_patients={cfg.max_patients}")
-    print(f"  use_roi        = True")
-    print(f"  clear_session  = True  clear_every={cfg.clear_every}")
-    print(f"  rebuild_after_clear = False  (model NOT reloaded after clear)")
-    print(f"  poll_sleep     ={cfg.poll_sleep}s")
-    print(f"  MALLOC_ARENA_MAX={os.environ.get('MALLOC_ARENA_MAX', '(not set)')}")
-    print(f"  log            ={cfg.log_prefix}.jsonl / .csv")
-    sys.stdout.flush()
+        print("[third_try] Inference loop (upstream-faithful, no CLI)")
+        print(f"  variable_batch = True  max_patients={cfg.max_patients}")
+        print(f"  use_roi        = True")
+        print(f"  clear_session  = True  clear_every={cfg.clear_every}")
+        print(f"  rebuild_after_clear = False  (model NOT reloaded after clear)")
+        print(f"  poll_sleep     ={cfg.poll_sleep}s")
+        print(f"  MALLOC_ARENA_MAX={os.environ.get('MALLOC_ARENA_MAX', '(not set)')}")
+        print(f"  log            ={cfg.log_prefix}.jsonl / .csv")
+        print(f"  web            =http://127.0.0.1:{WEB_PORT}/")
+        sys.stdout.flush()
 
-    iter_cnt = 0
-    t_start = time.time()
-    t_last_print = t_start
+        with _state_lock:
+            _rss_history.append((time.time(), float(proc.memory_info().rss)))
 
-    while not _stop_event.is_set():
-        container_manager.stream_advance(50)
+        iter_cnt = 0
+        t_start = time.time()
+        t_last_print = t_start
 
-        needed_ids = container_manager.active_ids(rng, max_n=cfg.max_patients)
+        while not _stop_event.is_set():
+            container_manager.stream_advance(50)
 
-        _segment(
-            model=model,
-            container_manager=container_manager,
-            needed_ids=needed_ids,
-            rng=rng,
+            needed_ids = container_manager.active_ids(rng, max_n=cfg.max_patients)
+
+            _segment(
+                model=model,
+                container_manager=container_manager,
+                needed_ids=needed_ids,
+                rng=rng,
+            )
+
+            iter_cnt += 1
+            rss = float(proc.memory_info().rss)
+            with _state_lock:
+                _iter_count = iter_cnt
+                _rss_history.append((time.time(), rss))
+
+            # Upstream: clear_session only — do not reload model (leaves stale Python ref;
+            # reproduces production behaviour / RSS spikes + trace-cache accumulation).
+            if iter_cnt % cfg.clear_every == 0:
+                K.clear_session()
+                gc.collect()
+
+            now = time.time()
+            if now - t_last_print >= 10.0:
+                rss_mb = rss / (1024 * 1024)
+                print(
+                    f"[{now - t_start:6.0f}s] iter={iter_cnt:6d}  "
+                    f"rss={rss_mb:.1f} MB  batch={len(needed_ids)}"
+                )
+                sys.stdout.flush()
+                t_last_print = now
+
+            time.sleep(cfg.poll_sleep)
+    except Exception as e:  # noqa: BLE001
+        with _state_lock:
+            _worker_error = repr(e)
+
+
+def _html_page() -> str:
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>RSS trend — third_try (upstream-faithful)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #0f1419; color: #e6edf3; }
+    header { padding: 1rem 1.25rem; border-bottom: 1px solid #30363d; }
+    h1 { font-size: 1.1rem; font-weight: 600; margin: 0; }
+    .meta { font-size: 0.85rem; color: #8b949e; margin-top: 0.35rem; }
+    main { padding: 1rem 1.25rem; max-width: 1100px; margin: 0 auto; }
+    .chart-wrap { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; height: 420px; }
+    .error { color: #f85149; margin-top: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RSS (resident set) — third_try IPM-style loop</h1>
+    <p class="meta" id="meta">Loading…</p>
+  </header>
+  <main>
+    <div class="chart-wrap"><canvas id="rss"></canvas></div>
+    <p class="error" id="err"></p>
+  </main>
+  <script>
+    const ctx = document.getElementById('rss');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'RSS (MB)',
+          data: [],
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          fill: true,
+          tension: 0.15,
+          pointRadius: 0,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+          x: { ticks: { color: '#8b949e', maxTicksLimit: 12 } },
+          y: {
+            ticks: { color: '#8b949e' },
+            title: { display: true, text: 'MB', color: '#8b949e' }
+          }
+        },
+        plugins: { legend: { labels: { color: '#e6edf3' } } }
+      }
+    });
+
+    async function tick() {
+      try {
+        const r = await fetch('/api/memory');
+        const j = await r.json();
+        let extra = '';
+        if (j.load) {
+          extra = '  load=' + JSON.stringify(j.load);
+        }
+        document.getElementById('meta').textContent =
+          'iter=' + j.iterations + '  rss_mb=' + j.rss_mb.toFixed(2) +
+          '  backend=' + j.tensorflow_version + extra;
+        if (j.error) {
+          document.getElementById('err').textContent = j.error;
+        } else {
+          document.getElementById('err').textContent = '';
+        }
+        if (j.series && j.series.length) {
+          const t0 = j.series[0][0];
+          chart.data.labels = j.series.map(([ts]) => (ts - t0).toFixed(1));
+          chart.data.datasets[0].data = j.series.map(([, rss]) => rss / (1024 * 1024));
+          chart.update('none');
+        }
+      } catch (e) {
+        document.getElementById('err').textContent = String(e);
+      }
+    }
+    setInterval(tick, 500);
+    tick();
+  </script>
+</body>
+</html>
+"""
+
+
+def create_app(cfg: RunConfig, tf_version_label: str) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        t_inf = threading.Thread(
+            target=_inference_loop, args=(cfg,), daemon=True, name="tf-infer"
+        )
+        t_log = threading.Thread(
+            target=_rss_logger, args=(cfg.log_prefix,), daemon=True, name="rss-log"
+        )
+        t_inf.start()
+        t_log.start()
+        try:
+            yield
+        finally:
+            _stop_event.set()
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.cfg = cfg
+    app.state.tf_version_label = tf_version_label
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> str:
+        return _html_page()
+
+    @app.get("/api/memory")
+    def api_memory():
+        with _state_lock:
+            series = list(_rss_history)
+            err = _worker_error
+            it = _iter_count
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss
+        c: RunConfig = app.state.cfg
+        load = {
+            "third_try": True,
+            "clear_every": c.clear_every,
+            "poll_sleep_sec": c.poll_sleep,
+            "max_patients": c.max_patients,
+            "base_ch": c.base_ch,
+            "ecg_input_num": ECG_INPUT_NUM,
+            "log_prefix": c.log_prefix,
+        }
+        return JSONResponse(
+            {
+                "rss_bytes": rss,
+                "rss_mb": rss / (1024 * 1024),
+                "iterations": it,
+                "leak": False,
+                "ipm_predict_batch_like": True,
+                "tensorflow_version": app.state.tf_version_label,
+                "load": load,
+                "series": series,
+                "error": err,
+            }
         )
 
-        iter_cnt += 1
-        with _state_lock:
-            _iter_count = iter_cnt
-
-        # Upstream: clear_session only — do not reload model (leaves stale Python ref;
-        # reproduces production behaviour / RSS spikes + trace-cache accumulation).
-        if iter_cnt % cfg.clear_every == 0:
-            K.clear_session()
-            gc.collect()
-
-        now = time.time()
-        if now - t_last_print >= 10.0:
-            rss_mb = proc.memory_info().rss / (1024 * 1024)
-            print(
-                f"[{now - t_start:6.0f}s] iter={iter_cnt:6d}  "
-                f"rss={rss_mb:.1f} MB  batch={len(needed_ids)}"
-            )
-            sys.stdout.flush()
-            t_last_print = now
-
-        time.sleep(cfg.poll_sleep)
+    return app
 
 
 def main() -> None:
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
+    import tensorflow as tf
+    import uvicorn
+
     cfg = RunConfig(
         log_prefix=LOG_PREFIX,
         base_ch=BASE_CH,
@@ -359,25 +536,13 @@ def main() -> None:
         clear_every=CLEAR_EVERY,
         max_patients=MAX_PATIENTS,
     )
-
-    def _handle_signal(*_):
-        print("\n[third_try] Signal received, stopping...")
-        _stop_event.set()
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    log_thread = threading.Thread(
-        target=_rss_logger, args=(cfg.log_prefix,), daemon=True, name="rss-log"
+    tf_version_label = f"tensorflow {tf.__version__}"
+    app = create_app(cfg, tf_version_label)
+    print(
+        f"[third_try] Web UI http://127.0.0.1:{WEB_PORT}/  (bind {WEB_HOST}:{WEB_PORT})",
+        flush=True,
     )
-    log_thread.start()
-
-    try:
-        _inference_loop(cfg)
-    except KeyboardInterrupt:
-        _stop_event.set()
-
-    print("[third_try] Done.")
+    uvicorn.run(app, host=WEB_HOST, port=WEB_PORT, log_level="info")
 
 
 if __name__ == "__main__":

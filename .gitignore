@@ -1,2 +1,6 @@
 .venv/
 .claude/
+__pycache__/
+*.py[cod]
+third_try/rss_log.csv
+third_try/rss_log.jsonl

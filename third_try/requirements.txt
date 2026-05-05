@@ -11,5 +11,7 @@ tensorboard-data-server==0.6.1
 tensorboard-plugin-wit==1.8.1
 numpy==1.24.4
 
-# RSS monitoring
+# RSS monitoring + web trend (same stack as second_try)
 psutil>=5.9.0
+fastapi>=0.109,<1
+uvicorn[standard]>=0.27,<1

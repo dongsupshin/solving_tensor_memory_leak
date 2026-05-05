@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # third_try: upstream-faithful reproduction — single profile, no CLI flags.
-# Matches production-style RSS behaviour (MALLOC_ARENA_MAX unset unless you export it).
+# Default: MALLOC_ARENA_MAX=2 (glibc malloc arena cap, same idea as second_try). Override: MALLOC_ARENA_MAX=8 ./run.sh
 #
 #   chmod +x run.sh && ./run.sh
 set -euo pipefail
+: "${MALLOC_ARENA_MAX:=2}"
+export MALLOC_ARENA_MAX
 cd "$(dirname "$0")" || {
   echo "Cannot cd to script directory."
   exit 1
