@@ -1,0 +1,16 @@
+# TensorFlow / Keras stack — exact pins matching upstream
+tensorflow-cpu==2.10.0
+tensorflow-estimator==2.10.0
+tensorflow-io-gcs-filesystem==0.37.0
+keras==2.10.0
+Keras-Preprocessing==1.1.2
+protobuf==3.19.6
+tensorboard==2.10.1
+tensorboard-data-server==0.6.1
+tensorboard-plugin-wit==1.8.1
+numpy==1.24.4
+
+# monitoring + web
+psutil>=5.9.0
+fastapi>=0.109,<1
+uvicorn[standard]>=0.27,<1
