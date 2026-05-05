@@ -42,7 +42,7 @@ N_CLASSES = 6
 LOG_PREFIX = "rss_log"
 BASE_CH = 32
 POLL_SLEEP = 0.2
-CLEAR_EVERY = 1000
+CLEAR_EVERY = 50
 MAX_PATIENTS = N_PATIENTS
 
 WEB_HOST = os.environ.get("THIRD_TRY_WEB_HOST", "0.0.0.0")
@@ -62,7 +62,8 @@ class RunConfig:
 _iter_count = 0
 _state_lock = threading.Lock()
 _stop_event = threading.Event()
-_rss_history: Deque[tuple[float, float]] = deque(maxlen=600)  # (unix_ts, rss_bytes)
+# Cumulative samples for the chart: (elapsed_sec_since_infer_start, rss_bytes). No maxlen — full run from t≈0.
+_rss_history: Deque[tuple[float, float]] = deque()
 _worker_error: str | None = None
 
 
@@ -325,8 +326,10 @@ def _inference_loop(cfg: RunConfig) -> None:
         print(f"  web            =http://127.0.0.1:{WEB_PORT}/")
         sys.stdout.flush()
 
+        loop_t0 = time.perf_counter()
         with _state_lock:
-            _rss_history.append((time.time(), float(proc.memory_info().rss)))
+            _rss_history.clear()
+            _rss_history.append((0.0, float(proc.memory_info().rss)))
 
         iter_cnt = 0
         t_start = time.time()
@@ -348,7 +351,7 @@ def _inference_loop(cfg: RunConfig) -> None:
             rss = float(proc.memory_info().rss)
             with _state_lock:
                 _iter_count = iter_cnt
-                _rss_history.append((time.time(), rss))
+                _rss_history.append((time.perf_counter() - loop_t0, rss))
 
             # Upstream: clear_session only — do not reload model (leaves stale Python ref;
             # reproduces production behaviour / RSS spikes + trace-cache accumulation).
@@ -420,7 +423,10 @@ def _html_page() -> str:
         maintainAspectRatio: false,
         animation: false,
         scales: {
-          x: { ticks: { color: '#8b949e', maxTicksLimit: 12 } },
+          x: {
+            ticks: { color: '#8b949e', maxTicksLimit: 14 },
+            title: { display: true, text: 'Elapsed (s)', color: '#8b949e' }
+          },
           y: {
             ticks: { color: '#8b949e' },
             title: { display: true, text: 'MB', color: '#8b949e' }
@@ -447,8 +453,7 @@ def _html_page() -> str:
           document.getElementById('err').textContent = '';
         }
         if (j.series && j.series.length) {
-          const t0 = j.series[0][0];
-          chart.data.labels = j.series.map(([ts]) => (ts - t0).toFixed(1));
+          chart.data.labels = j.series.map(([sec]) => Number(sec).toFixed(1));
           chart.data.datasets[0].data = j.series.map(([, rss]) => rss / (1024 * 1024));
           chart.update('none');
         }
