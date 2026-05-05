@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # third_try: upstream-faithful reproduction — single profile, no CLI flags.
-# Matches production-style RSS behaviour (MALLOC_ARENA_MAX unset unless you export it).
+# Caps glibc malloc arenas (same mitigation as second_try / production tuning).
 #
 #   chmod +x run.sh && ./run.sh
 set -euo pipefail
@@ -8,6 +8,8 @@ cd "$(dirname "$0")" || {
   echo "Cannot cd to script directory."
   exit 1
 }
+
+export MALLOC_ARENA_MAX=2
 
 _py_is_310() {
   "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[:2]==(3,10) else 1)' 2>/dev/null
