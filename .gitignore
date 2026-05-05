@@ -4,3 +4,8 @@ __pycache__/
 *.py[cod]
 third_try/rss_log.csv
 third_try/rss_log.jsonl
+
+fourth_try/rss_log.csv
+fourth_try/rss_log.jsonl
+fifth_try/rss_log*.csv
+fifth_try/rss_log*.jsonl
